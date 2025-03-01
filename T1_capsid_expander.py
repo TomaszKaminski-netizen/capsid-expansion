@@ -1,6 +1,7 @@
 """This script converts a viral capsid with T=1 triangulation number into
-either a T=3 or T=4 capsid. Developed with Python 3.8.19, Pandas 1.2.4, PyMol
-2.4.1, SciPy 1.6.2, Matplotlib 3.3.4, NumPy 1.20.1, and Boltons 23.0.0."""
+either a T=3 or T=4 capsid. Developed with Python 3.10.16, Pandas 2.2.3,
+NumPy 2.2.3, PyMol-open-source 3.1.0, SciPy 1.15.2, Matplotlib 3.10.0, Boltons
+24.0.0, and PDBFixer 1.11, all in an Anaconda environment."""
 #pylint: disable=invalid-name, logging-fstring-interpolation, unnecessary-lambda-assignment, too-many-lines
 
 from os.path import isfile, dirname, abspath # Works with both Linux and Windows
@@ -15,17 +16,14 @@ import logging
 import argparse
 
 from boltons.funcutils import wraps as bolton_wraps
-from scipy.spatial.distance import cdist, euclidean
+from scipy.spatial.distance import cdist
 from scipy.stats import gaussian_kde, linregress
 from matplotlib import pyplot as plt
 from pymol import cmd, finish_launching
 import numpy as np
 import pandas as pd
-try:
-    from pyrosetta import init, pose_from_pdb
-    no_pyrosetta = False
-except ImportError:
-    no_pyrosetta = True
+from openmm.app import PDBFile
+from pdbfixer import PDBFixer
 
 # Constants used in the functions below.
 PHI_NUM = (1 + 5**0.5) / 2 # The golden ratio
@@ -54,10 +52,13 @@ def icosahedron_spherical_cordinates():
 
 ICO_SPH_COORDS = icosahedron_spherical_cordinates()
 
-# Utility functions used in the functions below.
-np_centerofmass = lambda selection: np.array(cmd.centerofmass(selection)).reshape(1, -1)
-normalise = lambda vector: vector / np.linalg.norm(vector)
-# By default the rotation happens relative to camera coordinates, which is ridiculous.
+# Utility functions
+normalise = lambda vector: (vector / np.linalg.norm(vector)).flatten()
+# Some methods & functions (cdist) work only with 2D numpy arrays, whilst others demand 1D arrays.
+centerofmass_1D = lambda selection: np.array(cmd.centerofmass(selection))
+centerofmass_2D = lambda selection: np.array(cmd.centerofmass(selection)).reshape(1, -1)
+# By default the rotation happens relative to camera coordinates, which is ridiculous. Setting
+# camera=0 makes the function use absolute coordinates instead.
 pymol_rotate = lambda *args, **kwargs: cmd.rotate(*args, camera=0, **kwargs)
 
 ####################################################################################################
@@ -86,7 +87,7 @@ def load_file(rest_of_filename):
             pdb_of_interest = pdb_of_interest.lower()
             multimer_type = multimer_type.lower()
             if multimer_type not in ["trimer", "pentamer"]:
-                log.error(f"Wrong multimer_type specified '{multimer_type}', stopping.") #pylint: disable=used-before-assignment
+                log.error(f"Wrong multimer_type specified '{multimer_type}', stopping.") #pylint: disable=possibly-used-before-assignment
                 return False
             full_filename = pdb_of_interest + rest_of_filename.replace("?multimer?", multimer_type)
             if not isfile(full_filename):
@@ -182,7 +183,7 @@ def group_monomers(pdb_of_interest, multimer_type):
         bool: a statement whether the function has been ran successfully
     """
     monomers = cmd.get_names("objects")
-    monomer_coords = [np_centerofmass(mono) for mono in monomers]
+    monomer_coords = [centerofmass_2D(mono) for mono in monomers]
     df_monomer_coords = pd.DataFrame({"xyz": monomer_coords}, index=monomers)
 
     chain_desig = cycle("abc" if multimer_type == "trimer" else "abcde")
@@ -201,10 +202,10 @@ def group_monomers(pdb_of_interest, multimer_type):
         # The monomers need to be given distinct chain names before they are merged into a single
         # PyMol object. By default the names are ascending in the clockwise (when viewed from the
         # exterior of the capsid) direction.
-        np_multimer = np_centerofmass(" ".join(multimer_monos))
+        np_multimer = centerofmass_1D(" ".join(multimer_monos))
         rot_angles = [0] # Self-comparison yields an angle of 0
         for mono_2 in multimer_monos[1:]:
-            rot_angles.append(calculate_rotation(multimer_monos[0], np_centerofmass(mono_2),
+            rot_angles.append(calculate_rotation(multimer_monos[0], centerofmass_1D(mono_2),
                                                  fixed_point=np_multimer, rotate=False))
 
         for monomer in [multimer_monos[i] for i in np.argsort(rot_angles)]:
@@ -245,7 +246,8 @@ def find_multimer(coords, multimer_type, prot_of_interest=None):
     # original DataFrame.
     coords = coords.copy(deep=False)
     central_prot = coords.index[0] if prot_of_interest is None else prot_of_interest
-    coords["dist"] = coords["xyz"].apply(lambda x: euclidean(x, coords.loc[central_prot]["xyz"]))
+    np_central_prot = coords.loc[central_prot]["xyz"]
+    coords["dist"] = coords["xyz"].apply(lambda x: cdist(x, np_central_prot))
     # Finding the six closest neighbors was enough for almost all cases, but 2C9F needed nine to
     # find its trimers. 6NXE needed 12 neighbors to find its pentamers.
     neighbor_count = 12 if multimer_type == "pentamer" else 9
@@ -254,10 +256,10 @@ def find_multimer(coords, multimer_type, prot_of_interest=None):
     # Skipping over central_prot. Combinations returns ([A, B], [B, C], [A, C]) from [A, B, C].
     for pair in combinations(neighbors.index[1:], r=2):
         if multimer_type == "pentamer":
-            np_two_of_five = np_centerofmass(" ".join(pair))
+            np_two_of_five = centerofmass_2D(" ".join(pair))
             # The center of mass of two non-adjacent monomers in a pentamer lies close to the center
             # of mass of the pentamer / super-pentamer itself, which I exploit in this step.
-            neighbors["dist"] = neighbors["xyz"].apply(lambda x: euclidean(x, np_two_of_five)) #pylint: disable=cell-var-from-loop
+            neighbors["dist"] = neighbors["xyz"].apply(lambda x: cdist(x, np_two_of_five)) #pylint: disable=cell-var-from-loop
             multimer = neighbors.sort_values("dist").iloc[0:5, :1]
         else:
             multimer = neighbors.filter(items=[central_prot, *pair], axis="index")
@@ -270,9 +272,9 @@ def find_multimer(coords, multimer_type, prot_of_interest=None):
         multimer_proteins = " ".join(multimer.index)
         # multimer["xyz"] gives a nested array, which vstack() converts to a 2D array. Using stack()
         # here instead gave an incorrect 3D-array.
-        dist_from_multi = cdist(np.vstack(multimer["xyz"]), np_centerofmass(multimer_proteins))
+        dist_from_multi = cdist(np.vstack(multimer["xyz"]), centerofmass_2D(multimer_proteins))
         mean_dist = dist_from_multi.mean()
-        if not all(isclose(dist, mean_dist, rel_tol=0.02) for dist in dist_from_multi):
+        if not all(isclose(dist, mean_dist, rel_tol=0.02) for dist in dist_from_multi.flatten()):
             log.info("Wrong geometry, continuing.")
             continue
 
@@ -341,7 +343,7 @@ def find_two_superpentamers(trimer_of_interest=None):
     """
     all_trimers = cmd.get_names("objects")
     central_trimer = all_trimers[0] if trimer_of_interest is None else trimer_of_interest
-    trimer_coords = [np_centerofmass(trimer) for trimer in all_trimers]
+    trimer_coords = [centerofmass_2D(trimer) for trimer in all_trimers]
     df_trimer_coords = pd.DataFrame({"xyz": trimer_coords}, index=all_trimers)
 
     superpents = []
@@ -358,7 +360,7 @@ def find_two_superpentamers(trimer_of_interest=None):
         return False
 
     log.info(f"{central_trimer[0:4]} Found two superpentamers, continuing.")
-    return [[" ".join(superpent), np_centerofmass(" ".join(superpent))] for superpent in superpents]
+    return [[" ".join(superpent), centerofmass_1D(" ".join(superpent))] for superpent in superpents]
 
 
 def orient_capsid(two_superpents, trimer_of_interest=None):
@@ -386,23 +388,23 @@ def orient_capsid(two_superpents, trimer_of_interest=None):
     dist_from_origin = np.linalg.norm(superpent_1[1])
     # Pythagoras theorem and the golden ratio; dist_from_origin**2 = x**2 + (x*PHI_NUM)**2
     x = sqrt(dist_from_origin**2 / (1 + PHI_NUM**2))
-    np_wanted_superpent_1 = np.array([x, 0, x*PHI_NUM]).reshape(1, -1)
+    np_wanted_superpent_1 = np.array([x, 0, x*PHI_NUM])
     # Rotating the whole capsid to move the first super-pentamer to its desired position.
     superpent_1[1] = calculate_rotation(superpent_1[0], np_wanted_superpent_1)
     if isinstance(superpent_1[1], bool):
         return False
     # This rotation also moved the second super-pentamer.
-    superpent_2[1] = np_centerofmass(superpent_2[0])
+    superpent_2[1] = centerofmass_1D(superpent_2[0])
 
     # The desired coordinate of the second super-pentamer is the same as the first, but with -ve X.
-    np_wanted_superpent_2 = superpent_1[1] * [[-1, 1, 1]]
+    np_wanted_superpent_2 = superpent_1[1] * [-1, 1, 1]
     # Rotating the second super-pentamer into desired position without disturbing the first one.
     superpent_2[1] = calculate_rotation(superpent_2[0], np_wanted_superpent_2, superpent_1[1])
     if isinstance(superpent_2[1], bool):
         return False
 
     # Marking the vertex position now (not later) in case the next step rotates the capsid again.
-    cmd.pseudoatom("vertex_10p", pos=superpent_1[1].tolist()[0])
+    cmd.pseudoatom("vertex_10p", pos=superpent_1[1].tolist())
     # Ensuring the trimer of interest forms the correct icosahedron face: (-1,0,phi), (1,0,phi), and
     # (0,-phi,1), rather than (0,phi,1), which is the second possibility.
     if trimer_of_interest:
@@ -443,27 +445,26 @@ def calculate_rotation(proteins, wanted_coord, fixed_point=None, rotate=True):
             center of mass (or rotation was performed) or the rotation angle
             (if no rotation was done)
     """
-    current_coord = np_centerofmass(proteins)
+    current_coord = centerofmass_1D(proteins)
     if fixed_point is None:
         norm_wanted, norm_current = normalise(wanted_coord), normalise(current_coord)
-        rot_axis = normalise(np.cross(norm_wanted, norm_current)).tolist()[0]
+        rot_axis = normalise(np.cross(norm_wanted, norm_current)).tolist()
     else:
         norm_fixed = normalise(fixed_point)
-        rot_axis = norm_fixed.tolist()[0]
+        rot_axis = norm_fixed.tolist()
         # Finding the closest point to the current (and wanted) coords, laying on the rotation axis.
-        closest_point = norm_fixed * np.dot(current_coord, norm_fixed.reshape(3, -1))
+        closest_point = norm_fixed * np.dot(current_coord, norm_fixed)
         # Using it to get the angle of rotation around my axis.
         norm_wanted = normalise(wanted_coord - closest_point)
         norm_current = normalise(current_coord - closest_point)
 
-    # The np.dot function demands that the shape of the second vector is (1,3) instead of (3,1).
-    rot_angle = degrees(np.arccos(np.dot(norm_wanted, norm_current.reshape(3, -1))))
-    rot_sign = np.sign(np.dot(rot_axis, np.cross(norm_wanted, norm_current).reshape(3, -1)))
+    rot_angle = degrees(np.arccos(np.dot(norm_wanted, norm_current)))
+    rot_sign = float(np.sign(np.dot(rot_axis, np.cross(norm_wanted, norm_current))))
 
     if rotate: #pylint: disable=no-else-return
         # For PyMol, a positive angle would mean counter-clockwise rotation, which we don't want.
         pymol_rotate(angle=rot_angle * rot_sign * -1, axis=rot_axis, origin=[0, 0, 0])
-        new_coord = np_centerofmass(proteins)
+        new_coord = centerofmass_1D(proteins)
         if np.abs(new_coord - wanted_coord).max() > 2: # 2 Angstrom leeway
             log.error(f"{proteins[0:4]} Rotation not successful, stopping.")
             return False
@@ -490,7 +491,7 @@ def prepare_for_interface_morph(pdb_of_interest, multimer_type, hydrogens=False)
         str: name of the PyMol object containing the expansion trimer
     """
     # Finding the expansion trimer, located between vertexes (-1,0,phi), (1,0,phi), and (0,-phi,1).
-    [one, _, phi] = cmd.get_coords("vertex_10p").tolist()[0]
+    [one, _, phi] = cmd.get_coords("vertex_10p").flatten()
     np_3_vertex_mean = np.array([0, -phi / 3, (phi + phi + one) / 3]).reshape(1, -1)
     trimers = cmd.get_names("objects", selection="polymer.protein")
     np_trimers = np.array([cmd.centerofmass(tri) for tri in trimers])
@@ -529,17 +530,20 @@ def prepare_for_interface_morph(pdb_of_interest, multimer_type, hydrogens=False)
     plt.savefig(pdb_of_interest + "_interface_density.png", bbox_inches="tight")
     plt.clf()
 
-    # Filling in missing atoms (e.g. ends of lysine side-chains) and hydrogens with PyRosetta.
-    if not no_pyrosetta:
-        cmd.save(f"{pdb_of_interest}_temp1.pdb", selection=expansion_trimer)
-        init()
-        # The act of loading the file into PyRosetta automatically fills in missing atoms.
-        pose = pose_from_pdb(f"{pdb_of_interest}_temp1.pdb")
-        remove(f"{pdb_of_interest}_temp1.pdb")
-        pose.dump_pdb(f"{pdb_of_interest}_temp2.pdb")
-        cmd.delete(f"{expansion_trimer} tri_1")
-        cmd.load(f"{pdb_of_interest}_temp2.pdb", object=expansion_trimer)
-        remove(f"{pdb_of_interest}_temp2.pdb")
+    # Filling in missing atoms (e.g. ends of lysine side-chains) and hydrogens with PDBFixer.
+    cmd.save(f"{pdb_of_interest}_temp1.pdb", selection=expansion_trimer)
+    cmd.delete(f"{expansion_trimer} tri_1")
+    fixer = PDBFixer(f"{pdb_of_interest}_temp1.pdb")
+    remove(f"{pdb_of_interest}_temp1.pdb")
+    fixer.findMissingResidues()
+    if len(fixer.missingResidues) > 10: #? Users are unlikely to want to add huge domains back in?
+        fixer.missingResidues = {}
+    fixer.findMissingAtoms()
+    fixer.addMissingAtoms()
+    fixer.addMissingHydrogens(7.0)
+    PDBFile.writeFile(fixer.topology, fixer.positions, f"{pdb_of_interest}_temp2.pdb", keepIds=True)
+    cmd.load(f"{pdb_of_interest}_temp2.pdb", object=expansion_trimer)
+    remove(f"{pdb_of_interest}_temp2.pdb")
 
     # Having all the hydrogens present roughly doubles the simulation time.
     if not hydrogens:
@@ -753,9 +757,9 @@ def expand_capsid(morphed_trimer_file):
     cmd.delete("not asymm & not vertex_0-p1")
 
     # Placing the first vertex & asymmetric unit on the very top of the capsid (and the z axis).
-    np_t34_vertex = cmd.get_coords("vertex_0-p1")
-    z_axis = np.array([0, 0, 1]).reshape(3, -1)
-    angle_from_z = degrees(np.arccos(np.dot(normalise(np_t34_vertex), z_axis)))
+    norm_t34_vertex = normalise(cmd.get_coords("vertex_0-p1"))
+    z_axis = np.array([0, 0, 1])
+    angle_from_z = degrees(np.arccos(np.dot(norm_t34_vertex, z_axis)))
     pymol_rotate(selection="(all)", origin=[0, 0, 0], angle=angle_from_z * -1, axis="x")
     pymol_rotate(selection="(all)", origin=[0, 0, 0], angle=180, axis="z")
 
@@ -812,7 +816,7 @@ def t4_distance_adjustment():
     np_3fold_coords = cmd.get_coords("asymm_corner_* & name PS1")
     np_3fold_distances = cdist(np_3fold_coords, np_3fold_coords)
     # Inspecting the distance of each 3fold_symm pseudoatom from its two nearest neighbors.
-    if np.sort(np_3fold_distances, axis=0)[1:3].max() > 0.25: # 0.25 Angstrom leeway
+    if np.sort(np_3fold_distances, axis=0)[1:3].max() > 0.4: # 0.4 Angstrom leeway
         yield False
     else:
         cmd.remove("asymm_corner* & name PS1") # Removing the 3fold_symm pseudoatoms
@@ -857,7 +861,7 @@ def create_corners(spherical_coords):
         # Checking that the predicted vertex location and the corner's actual center of mass match.
         # Because of how the vertex location was previously calculated, the corner's center of
         # mass must now also be obtained based solely on asymmetric unit chains a+b+c (i.e. not d).
-        np_corner = np_centerofmass("(" + " ".join(asymm_units) + ") & chain a+b+c")
+        np_corner = centerofmass_2D("(" + " ".join(asymm_units) + ") & chain a+b+c")
         if np.abs(np_corner - np_vertex).max() > 3: # 3 Angstrom tolerance
             return corner_num
     return None
@@ -1001,7 +1005,6 @@ def run_pipeline(pdb_list, t_nums, mode=1, vary_radius=(0,1,1)):
 ####################################################################################################
 
 # Numpy arrays require tolist() to be accepted by PyMol cmd functions, but not by other functions.
-# Many methods and functions (cdist, np.dot, np.cross) work only with 2D numpy arrays.
 # Round brackets are extremely important when writing PyMol selections.
 
 if __name__ == "__main__":

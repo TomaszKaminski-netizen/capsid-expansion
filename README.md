@@ -10,7 +10,7 @@ Importantly, this expansion can be done by simply copying and rearranging the co
 
 ## Setup
 
-The script was developed with Python 3.8.19, Pandas 1.2.4, PyMol 2.4.1, SciPy 1.6.2, Matplotlib 3.3.4, NumPy 1.20.1, and Boltons 23.0.0. It has not been tested for version compatibility, so it’s recommended to create a virtual environment with these specific versions to avoid issues. PyRosetta is an optional library, used for filling in missing atoms (e.g. lysine sidechains that were poorly resolved in the starting T1 crystal structure). The code is compatible with both Windows and Linux.
+The script was developed with Python 3.10.16, Pandas 2.2.3, NumPy 2.2.3, PyMol-open-source 3.1.0, SciPy 1.15.2, Matplotlib 3.10.0, Boltons 24.0.0, and PDBFixer 1.11, all in an Anaconda environment. It has not been tested for version compatibility, so it’s recommended to create a virtual environment with these specific versions to avoid issues. The code is compatible with both Windows and Linux.
 
 ## Usage
 
